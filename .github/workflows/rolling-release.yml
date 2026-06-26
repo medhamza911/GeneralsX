@@ -1,0 +1,140 @@
+name: Rolling Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: rolling-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-flatpak:
+    uses: ./.github/workflows/build-linux-flatpak.yml
+    with:
+      preset: linux64-deploy
+
+  build-macos:
+    uses: ./.github/workflows/build-macos.yml
+    with:
+      preset: macos-vulkan
+
+  build-windows-zh:
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      game: GeneralsMD
+      preset: windows64-deploy
+
+  build-windows-generals:
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      game: Generals
+      preset: windows64-deploy
+
+  publish-rolling:
+    needs: [build-linux-flatpak, build-macos, build-windows-zh, build-windows-generals]
+    if: always() && (needs.build-linux-flatpak.result == 'success' && needs.build-macos.result == 'success')
+    runs-on: ubuntu-latest
+    env:
+      ROLLING_TAG: latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Stage release assets
+        id: assets
+        run: |
+          set -e
+          mkdir -p release-assets
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          LINUX_ZH_FLATPAK=$(find artifacts -path "*linux-flatpak-generalsxzh*" -name "*.flatpak" | head -1 || true)
+          LINUX_GENERALS_FLATPAK=$(find artifacts -path "*linux-flatpak-generalsx*" -name "*.flatpak" | head -1 || true)
+          MAC_ZH_TAR=$(find artifacts -path "*macos-generalsxzh*" -name "*.tar" | head -1 || true)
+          MAC_GENERALS_TAR=$(find artifacts -path "*macos-generalsx*" -name "*.tar" | head -1 || true)
+
+          [ -n "$LINUX_ZH_FLATPAK" ]      && cp "$LINUX_ZH_FLATPAK"      "release-assets/GeneralsXZH-linux.flatpak"
+          [ -n "$LINUX_GENERALS_FLATPAK" ] && cp "$LINUX_GENERALS_FLATPAK" "release-assets/GeneralsX-linux.flatpak"
+
+          if [ -n "$MAC_ZH_TAR" ]; then
+            cp "$MAC_ZH_TAR" "release-assets/GeneralsXZH-macos-arm64.app.tar"
+            (cd release-assets && zip -j "macos-generalsxzh-app.tar.zip" "GeneralsXZH-macos-arm64.app.tar")
+          fi
+          if [ -n "$MAC_GENERALS_TAR" ]; then
+            cp "$MAC_GENERALS_TAR" "release-assets/GeneralsX-macos-arm64.app.tar"
+            (cd release-assets && zip -j "macos-generalsx-app.tar.zip" "GeneralsX-macos-arm64.app.tar")
+          fi
+
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          ls -la release-assets
+
+      - name: Write release notes
+        run: |
+          {
+            echo "Rolling build from \`main\` — automatically rebuilt on every commit."
+            echo ""
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            echo "Latest commit message:"
+            echo ""
+            echo '```'
+            git log -1 --pretty=format:'%s%n%n%b' "$GITHUB_SHA"
+            echo '```'
+          } > release-assets/ROLLING_NOTES.md
+
+      - name: Move rolling tag to current commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f "$ROLLING_TAG" "$GITHUB_SHA"
+          git push origin -f "refs/tags/$ROLLING_TAG"
+
+      - name: Publish/refresh rolling prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          # Delete previous rolling release (assets included), if any.
+          if gh release view "$ROLLING_TAG" >/dev/null 2>&1; then
+            gh release delete "$ROLLING_TAG" --yes --cleanup-tag=false
+          fi
+
+          # Recreate with fresh assets pointing at the new tag.
+          ASSETS=()
+          for f in release-assets/GeneralsX-linux.flatpak \
+                   release-assets/GeneralsXZH-linux.flatpak \
+                   release-assets/macos-generalsx-app.tar.zip \
+                   release-assets/macos-generalsxzh-app.tar.zip; do
+            [ -f "$f" ] && ASSETS+=("$f")
+          done
+
+          gh release create "$ROLLING_TAG" \
+            --target "$GITHUB_SHA" \
+            --title "Rolling build (main @ ${{ steps.assets.outputs.short_sha }})" \
+            --notes-file release-assets/ROLLING_NOTES.md \
+            --prerelease \
+            "${ASSETS[@]}"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Rolling Release Published"
+            echo ""
+            echo "- Tag: \`$ROLLING_TAG\` (force-moved to ${{ steps.assets.outputs.short_sha }})"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            ls release-assets | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
